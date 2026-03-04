@@ -1,0 +1,184 @@
+import pandas as pd
+
+# -------------------------------
+# 1. LOAD NFIRS FILES
+# -------------------------------
+
+incidents = pd.read_csv(
+    '/Users/mpinedo/Downloads/basicincident.txt',
+    delimiter='^',
+    quotechar='"',
+    encoding='ISO-8859-1'
+)
+
+fires = pd.read_csv(
+    '/Users/mpinedo/Downloads/Hannah code/Hannah code.txt/fireincident.txt',
+    delimiter='^',
+    quotechar='"',
+    encoding='ISO-8859-1'
+)
+
+address = pd.read_csv(
+    '/Users/mpinedo/Downloads/incidentaddress.txt',
+    delimiter='^',
+    quotechar='"',
+    encoding='ISO-8859-1'
+)
+
+# -------------------------------
+# 2. MERGE INCIDENT + ADDRESS
+# -------------------------------
+
+merged_df1 = pd.merge(incidents, address, on='INCIDENT_KEY', how='left')
+
+# -------------------------------
+# 3. FILTER NORTH CAROLINA
+# -------------------------------
+
+merged_nc = merged_df1[merged_df1['STATE_x'] == 'NC']
+
+# -------------------------------
+# 4. FILTER RALEIGH
+# -------------------------------
+
+cities = ['Raleigh', 'Raleigh DC', 'Raliegh', 'RALEIGH']
+merged_raleigh = merged_nc[merged_nc['CITY'].isin(cities)]
+
+merged_raleigh['ZIP5'] = (
+    merged_raleigh['ZIP5']
+    .astype(str)
+    .str.replace(r'\.0$', '', regex=True)
+)
+
+merged_raleigh = merged_raleigh.drop_duplicates()
+
+# -------------------------------
+# 5. FILTER FIRE INCIDENT CODES (100–199)
+# -------------------------------
+
+valid_incident_codes = list(range(100,199))
+filtered_df = merged_raleigh[
+    merged_raleigh['INC_TYPE'].isin(valid_incident_codes)
+]
+
+filtered_df = filtered_df.dropna(subset=['DEPT_STA'])
+
+# -------------------------------
+# 6. RESPONSE TIME CALCULATION
+# -------------------------------
+
+filtered_df['ALARM'] = pd.to_datetime(filtered_df['ALARM'])
+filtered_df['ARRIVAL'] = pd.to_datetime(filtered_df['ARRIVAL'])
+
+filtered_df['RESPONSE_TIME'] = (
+    filtered_df['ARRIVAL'] - filtered_df['ALARM']
+)
+
+filtered_df = filtered_df.dropna(subset=['RESPONSE_TIME'])
+
+# -------------------------------
+# 7. FILTER 2024
+# -------------------------------
+
+filtered_df['INC_DATE_x'] = filtered_df['INC_DATE_x'].astype(str)
+filtered_df_2024 = filtered_df[
+    filtered_df['INC_DATE_x'].str[-4:] == '2024'
+]
+
+print("NFIRS Raleigh 2024 incidents:", len(filtered_df_2024))
+
+fire_incidents = [
+    "Building fire",
+    "Cooking fire confined to container",
+    "Passenger vehicle fire",
+    "Grass fire",
+    "Brush or brush-and-grass mixture fire",
+    "Dumpster or other outside trash receptacle fire"
+]
+
+df = pd.read_csv(
+    'Fire_Incidents.csv',
+    parse_dates=['dispatch_date_time','arrive_date_time'],
+    encoding='ISO-8859-1'
+)
+
+fire_df = df[df['incident_type_description'].isin(fire_incidents)]
+
+fire_df['arrive_date_time_EST'] = (
+    fire_df['arrive_date_time']
+    .dt.tz_convert('US/Eastern')
+)
+
+fire_df = fire_df[
+    fire_df['arrive_date_time_EST'].dt.year == 2024
+]
+
+fire_df = fire_df.dropna(subset=['station'])
+fire_df = fire_df.drop_duplicates()
+
+print("Raleigh Open Dataset 2024 fires:", len(fire_df))
+
+import osmnx as ox
+import networkx as nx
+import geopandas as gpd
+import numpy as np
+from gurobipy import Model, GRB, quicksum
+
+# Load Raleigh road network
+G = ox.graph_from_place("Raleigh, North Carolina, USA", network_type="drive")
+
+G = ox.add_edge_speeds(G)
+G = ox.add_edge_travel_times(G)
+
+# Convert fire_df lat/lon to GeoDataFrame
+fire_gdf = gpd.GeoDataFrame(
+    fire_df,
+    geometry=gpd.points_from_xy(fire_df.longitude, fire_df.latitude),
+    crs="EPSG:4326"
+)
+
+incident_nodes = ox.nearest_nodes(
+    G,
+    fire_gdf.geometry.x,
+    fire_gdf.geometry.y
+)
+
+fire_gdf["node"] = incident_nodes
+incident_nodes = list(set(incident_nodes))
+
+all_nodes = list(G.nodes)
+
+travel_time = {}
+
+for i in incident_nodes:
+    lengths = nx.single_source_dijkstra_path_length(
+        G, i, weight="travel_time"
+    )
+    for j in all_nodes:
+        travel_time[(i,j)] = lengths.get(j, 1e7)
+
+P = 20   # example for Raleigh
+
+model = Model("Raleigh_PMedian")
+
+x = model.addVars(all_nodes, vtype=GRB.BINARY)
+y = model.addVars(incident_nodes, all_nodes, vtype=GRB.BINARY)
+
+model.setObjective(
+    quicksum(travel_time[(i,j)] * y[i,j]
+             for i in incident_nodes
+             for j in all_nodes),
+    GRB.MINIMIZE
+)
+
+for i in incident_nodes:
+    model.addConstr(quicksum(y[i,j] for j in all_nodes) == 1)
+
+for i in incident_nodes:
+    for j in all_nodes:
+        model.addConstr(y[i,j] <= x[j])
+
+model.addConstr(quicksum(x[j] for j in all_nodes) == P)
+
+model.optimize()
+
